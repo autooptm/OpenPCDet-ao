@@ -102,6 +102,11 @@ if __name__ == '__main__':
                 ],
             ),
             make_cuda_ext(
+                name='pointnet2_stack_fast_cuda',
+                module='pcdet.ops.pointnet2.pointnet2_stack',
+                sources=['src/opt_ops_gpu.cu'],
+            ),
+            make_cuda_ext(
                 name='pointnet2_batch_cuda',
                 module='pcdet.ops.pointnet2.pointnet2_batch',
                 sources=[

@@ -1,3 +1,68 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>OpenPCDet · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.31x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.31x-2ea44f"></a>
+    <a href="https://github.com/open-mmlab/OpenPCDet/commit/233f849829b6ac19afb8af8837a0246890908755"><img alt="base" src="https://img.shields.io/badge/upstream-233f849829b6-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [open-mmlab/OpenPCDet](https://github.com/open-mmlab/OpenPCDet) at commit
+> [`233f849829b6`](https://github.com/open-mmlab/OpenPCDet/commit/233f849829b6ac19afb8af8837a0246890908755) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python demo.py --cfg_file cfgs/kitti_models/pv_rcnn.yaml --ckpt pv_rcnn_8369.pth --data_path ${POINT_CLOUD_DATA}` (from `tools/`, as `docs/DEMO.md` documents) |
+| **Entry point** | `tools/demo.py` |
+| **Unit measured** | one KITTI LiDAR scan: `.bin` read → voxelisation → PV-RCNN forward including RoI refinement and NMS → detections handed to the viewer; measured over 341 KITTI raw scans from 5 drives in one process, the viewer replaced by a no-op on the headless card |
+| **Before (stock)** | 102.3 ms per scan (34.9 s for the timed scan loop) |
+| **After (this tree, all switches default ON)** | 30.6 ms per scan (10.6 s for the timed scan loop; the first 32 scans are a warm-up in both runs and are not included) |
+| **Speedup** | **3.31x** end to end on RTX 4090, noise floor of the host 3.4% |
+| **Output** | detections (per-class scores and box heights, rasterised in bird's-eye view) within 6e-4 of the stock program's on 99.9% of the raster, and within 4e-4 on a held-out set of scans the optimiser never saw -- 170x below the model's own 0.1 score threshold |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `pcdet/ops/pointnet2/pointnet2_stack/src/opt_ops_gpu.cu` (new) | ball_query_wrapper() | 1.47x |
+| `pcdet/ops/pointnet2/pointnet2_stack/src/opt_ops_gpu.cu` (new) | farthest_point_sampling_wrapper() | 1.29x |
+| `pcdet/ops/pointnet2/pointnet2_stack/pointnet2_modules.py` | StackSAModuleMSG.forward() | 1.09x |
+| `pcdet/ops/pointnet2/pointnet2_stack/pointnet2_utils.py` | BallQuery / GroupingOperation / QueryAndGroup | 1.08x |
+| `pcdet/models/backbones_2d/base_bev_backbone.py` | BaseBEVBackbone.forward() | 1.02x |
+| `pcdet/datasets/dataset.py` | DatasetTemplate.prepare_data() (new helpers) | -- |
+| `setup.py` | ext_modules (builds the new `.cu` file) | -- |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/OpenPCDet-ao.git
+cd OpenPCDet-ao
+# install as upstream documents (docs/INSTALL.md). The patch adds a CUDA source and changes setup.py,
+# so the pcdet extension must be rebuilt, even over an existing install:
+python setup.py develop
+# pv_rcnn_8369.pth from the upstream model zoo, KITTI-format .bin scans in ${POINT_CLOUD_DATA}, then:
+cd tools
+python demo.py --cfg_file cfgs/kitti_models/pv_rcnn.yaml --ckpt pv_rcnn_8369.pth --data_path ${POINT_CLOUD_DATA}
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 233f849829b6` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <img src="docs/open_mmlab.png" align="right" width="30%">
 
 # OpenPCDet

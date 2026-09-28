@@ -1,0 +1,628 @@
+diff --git a/pcdet/datasets/dataset.py b/pcdet/datasets/dataset.py
+index c1a7f6b..fcead07 100644
+--- a/pcdet/datasets/dataset.py
++++ b/pcdet/datasets/dataset.py
+@@ -1,3 +1,4 @@
++import os
+ from collections import defaultdict
+ from pathlib import Path
+ 
+@@ -176,6 +177,11 @@ class DatasetTemplate(torch_data.Dataset):
+                 voxel_num_points: optional (num_voxels)
+                 ...
+         """
++        if not self.training and set(data_dict) <= {'points', 'frame_id'}:
++            plan = self._opt_4()
++            if plan:
++                return self._opt_5(data_dict, plan)
++
+         if self.training:
+             assert 'gt_boxes' in data_dict, 'gt_boxes should be provided for training'
+             gt_boxes_mask = np.array([n in self.class_names for n in data_dict['gt_names']], dtype=np.bool_)
+@@ -217,8 +223,87 @@ class DatasetTemplate(torch_data.Dataset):
+ 
+         return data_dict
+ 
++    def _opt_4(self):
++        plan = getattr(self, '_opt_7', None)
++        if plan is not None:
++            return plan
++        plan = False
++        enc = self.point_feature_encoder.point_encoding_config
++        queue = self.data_processor.data_processor_queue
++        names = [getattr(f, 'func', f).__name__ for f in queue]
++        if (os.environ.get('PCDET_OPT_1', '1') != '0' and torch.cuda.is_available()
++                and torch_data.get_worker_info() is None
++                and enc.encoding_type == 'absolute_coordinates_encoding'
++                and list(enc.used_feature_list) == list(enc.src_feature_list)
++                and names == ['mask_points_and_boxes_outside_range', 'shuffle_points', 'transform_points_to_voxels']):
++            vox_cfg = queue[2].keywords['config']
++            if not vox_cfg.get('DOUBLE_FLIP', False) and not queue[1].keywords['config'].SHUFFLE_ENABLED[self.mode]:
++                dev = torch.device('cuda', torch.cuda.current_device())
++                grid = [int(g) for g in self.data_processor.grid_size]
++                plan = {
++                    'range': torch.tensor(self.point_cloud_range, dtype=torch.float32, device=dev),
++                    'voxel_size': torch.tensor(vox_cfg.VOXEL_SIZE, dtype=torch.float32, device=dev),
++                    'grid': grid, 'grid_t': torch.tensor(grid, dtype=torch.float32, device=dev),
++                    'max_points': int(vox_cfg.MAX_POINTS_PER_VOXEL),
++                    'max_voxels': int(vox_cfg.MAX_NUMBER_OF_VOXELS[self.mode]),
++                }
++        self._opt_7 = plan
++        return plan
++
++    def _opt_5(self, data_dict, plan):
++        """Same outputs as the CPU path (mask_points_by_range + spconv Point2VoxelCPU3d): voxels are
++        numbered in order of first point arrival, filled in point order up to max_points, capped at
++        max_voxels (later new voxels dropped), zero padded; coords (z, y, x)."""
++        rng = plan['range']
++        pts = torch.from_numpy(data_dict['points']).to(rng.device)
++        mask = (pts[:, 0] >= rng[0]) & (pts[:, 0] <= rng[3]) & (pts[:, 1] >= rng[1]) & (pts[:, 1] <= rng[4])
++        pts = pts[mask]
++        coor = torch.floor((pts[:, :3] - rng[:3]) / plan['voxel_size'])
++        valid_idx = ((coor >= 0) & (coor < plan['grid_t'])).all(dim=1).nonzero().squeeze(1)
++        coor = coor[valid_idx].long()
++        gx, gy, _ = plan['grid']
++        key = (coor[:, 2] * gy + coor[:, 1]) * gx + coor[:, 0]
++        uniq, inv = torch.unique(key, sorted=True, return_inverse=True)
++        num_uniq = uniq.numel()
++        first = torch.full((num_uniq,), torch.iinfo(torch.int64).max, dtype=torch.int64, device=pts.device)
++        first.scatter_reduce_(0, inv, valid_idx, reduce='amin', include_self=True)
++        order = torch.argsort(first)
++        rank = torch.empty_like(order)
++        rank[order] = torch.arange(num_uniq, device=pts.device)
++        num_voxels = min(num_uniq, plan['max_voxels'])
++        point_rank = rank[inv]
++        counts = torch.bincount(point_rank, minlength=num_uniq)
++        sorted_rank, perm = torch.sort(point_rank, stable=True)
++        slot = torch.empty_like(point_rank)
++        slot[perm] = torch.arange(point_rank.numel(), device=pts.device) - (torch.cumsum(counts, 0) - counts)[sorted_rank]
++        keep = (point_rank < num_voxels) & (slot < plan['max_points'])
++        voxels = pts.new_zeros((num_voxels, plan['max_points'], pts.shape[1]))
++        voxels[point_rank[keep], slot[keep]] = pts[valid_idx[keep]]
++        k = uniq[order[:num_voxels]]
++        coords = torch.stack([k // (gx * gy), (k // gx) % gy, k % gx], dim=1).int()
++        return {'points': pts, 'frame_id': data_dict.get('frame_id'), 'lidar_aug_matrix': np.eye(4),
++                'use_lead_xyz': True, 'voxels': voxels, 'voxel_coords': coords,
++                'voxel_num_points': counts[:num_voxels].clamp(max=plan['max_points']).int()}
++
++    @staticmethod
++    def _opt_6(sample):
++        pts, coords = sample['points'], sample['voxel_coords']
++        dev = pts.device
++        return {
++            'points': torch.cat([pts.new_zeros((pts.shape[0], 1)), pts], dim=1),
++            'frame_id': np.stack([sample['frame_id']], axis=0),
++            'lidar_aug_matrix': torch.from_numpy(np.stack([sample['lidar_aug_matrix']], axis=0)).float().to(dev),
++            'use_lead_xyz': torch.ones(1, dtype=torch.float32, device=dev),
++            'voxels': sample['voxels'],
++            'voxel_coords': torch.cat([coords.new_zeros((coords.shape[0], 1)), coords], dim=1).float(),
++            'voxel_num_points': sample['voxel_num_points'].float(),
++            'batch_size': 1,
++        }
++
+     @staticmethod
+     def collate_batch(batch_list, _unused=False):
++        if len(batch_list) == 1 and torch.is_tensor(batch_list[0].get('voxels')):
++            return DatasetTemplate._opt_6(batch_list[0])
+         data_dict = defaultdict(list)
+         for cur_sample in batch_list:
+             for key, val in cur_sample.items():
+diff --git a/pcdet/models/backbones_2d/base_bev_backbone.py b/pcdet/models/backbones_2d/base_bev_backbone.py
+index 4dc7dbb..b818b7c 100644
+--- a/pcdet/models/backbones_2d/base_bev_backbone.py
++++ b/pcdet/models/backbones_2d/base_bev_backbone.py
+@@ -1,7 +1,11 @@
++import os
++
+ import numpy as np
+ import torch
+ import torch.nn as nn
+ 
++_OPT_8 = os.environ.get('PCDET_OPT_2', '1') != '0'
++
+ 
+ class BaseBEVBackbone(nn.Module):
+     def __init__(self, model_cfg, input_channels):
+@@ -86,28 +90,31 @@ class BaseBEVBackbone(nn.Module):
+         Returns:
+         """
+         spatial_features = data_dict['spatial_features']
+-        ups = []
+-        ret_dict = {}
+-        x = spatial_features
+-        for i in range(len(self.blocks)):
+-            x = self.blocks[i](x)
++        opt_9 = _OPT_8 and not self.training and spatial_features.is_cuda
++        with torch.autocast('cuda', dtype=torch.float16, enabled=opt_9):
++            ups = []
++            ret_dict = {}
++            x = spatial_features
++            for i in range(len(self.blocks)):
++                x = self.blocks[i](x)
++
++                stride = int(spatial_features.shape[2] / x.shape[2])
++                ret_dict['spatial_features_%dx' % stride] = x
++                if len(self.deblocks) > 0:
++                    ups.append(self.deblocks[i](x))
++                else:
++                    ups.append(x)
+ 
+-            stride = int(spatial_features.shape[2] / x.shape[2])
+-            ret_dict['spatial_features_%dx' % stride] = x
+-            if len(self.deblocks) > 0:
+-                ups.append(self.deblocks[i](x))
+-            else:
+-                ups.append(x)
++            if len(ups) > 1:
++                x = torch.cat(ups, dim=1)
++            elif len(ups) == 1:
++                x = ups[0]
+ 
+-        if len(ups) > 1:
+-            x = torch.cat(ups, dim=1)
+-        elif len(ups) == 1:
+-            x = ups[0]
++            if len(self.deblocks) > len(self.blocks):
++                x = self.deblocks[-1](x)
+ 
+-        if len(self.deblocks) > len(self.blocks):
+-            x = self.deblocks[-1](x)
+ 
+-        data_dict['spatial_features_2d'] = x
++        data_dict['spatial_features_2d'] = x.float()
+ 
+         return data_dict
+ 
+diff --git a/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_modules.py b/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_modules.py
+index 0210ab2..b0783fa 100644
+--- a/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_modules.py
++++ b/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_modules.py
+@@ -87,11 +87,22 @@ class StackSAModuleMSG(nn.Module):
+             new_features: (M1 + M2 ..., \sum_k(mlps[k][-1])) tensor of the new_features descriptors
+         """
+         new_features_list = []
++        fused = pointnet2_utils._fast is not None and features is not None and xyz.is_cuda \
++            and all(g.use_xyz for g in self.groupers)
+         for k in range(len(self.groupers)):
+-            new_features, ball_idxs = self.groupers[k](
+-                xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features
+-            )  # (M1 + M2, C, nsample)
+-            new_features = new_features.permute(1, 0, 2).unsqueeze(dim=0)  # (1, C, M1 + M2 ..., nsample)
++            if fused:
++                grouper = self.groupers[k]
++                ball_idxs, empty_ball_mask = pointnet2_utils.ball_query(
++                    grouper.radius, grouper.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
++                new_features = xyz.new_empty((1, features.shape[1] + 3, new_xyz.shape[0], grouper.nsample))
++                pointnet2_utils._fast.fused_group_wrapper(
++                    xyz_batch_cnt.shape[0], new_xyz.shape[0], features.shape[1], grouper.nsample, xyz, features,
++                    xyz_batch_cnt, new_xyz, ball_idxs, new_xyz_batch_cnt, empty_ball_mask, new_features)
++            else:
++                new_features, ball_idxs = self.groupers[k](
++                    xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features
++                )  # (M1 + M2, C, nsample)
++                new_features = new_features.permute(1, 0, 2).unsqueeze(dim=0)  # (1, C, M1 + M2 ..., nsample)
+             new_features = self.mlps[k](new_features)  # (1, C, M1 + M2 ..., nsample)
+ 
+             if self.pool_method == 'max_pool':
+diff --git a/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_utils.py b/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_utils.py
+index cd2c1f3..a7b88eb 100644
+--- a/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_utils.py
++++ b/pcdet/ops/pointnet2/pointnet2_stack/pointnet2_utils.py
+@@ -1,3 +1,5 @@
++import os
++
+ import torch
+ import torch.nn as nn
+ from torch.autograd import Function, Variable
+@@ -5,6 +7,30 @@ from torch.autograd import Function, Variable
+ from . import pointnet2_stack_cuda as pointnet2
+ 
+ 
++def _load_fast_ops():
++    if os.environ.get('PCDET_OPT_3', '1') == '0':
++        return None
++    try:
++        from . import pointnet2_stack_fast_cuda
++        return pointnet2_stack_fast_cuda
++    except ImportError:
++        pass
++    try:
++        from torch.utils.cpp_extension import load
++        return load(name='pointnet2_stack_fast_cuda', extra_cuda_cflags=['-O3'], verbose=False,
++                    sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'opt_ops_gpu.cu')])
++    except Exception as e:
++        print('pointnet2_stack: optimized ops unavailable (%s), using the stock path' % e)
++        return None
++
++
++_fast = _load_fast_ops()
++_DEBUG_ASSERTS = os.environ.get('PCDET_DEBUG_ASSERTS', '0') == '1'
++_ball_query_wrapper = _fast.ball_query_wrapper if _fast is not None else pointnet2.ball_query_wrapper
++_group_points_wrapper = _fast.group_points_wrapper if _fast is not None else pointnet2.group_points_wrapper
++_fps_wrapper = _fast.farthest_point_sampling_wrapper if _fast is not None else pointnet2.farthest_point_sampling_wrapper
++
++
+ class BallQuery(Function):
+ 
+     @staticmethod
+@@ -32,9 +58,9 @@ class BallQuery(Function):
+         M = new_xyz.shape[0]
+         idx = torch.cuda.IntTensor(M, nsample).zero_()
+ 
+-        pointnet2.ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
++        _ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
+         empty_ball_mask = (idx[:, 0] == -1)
+-        idx[empty_ball_mask] = 0
++        idx.masked_fill_(empty_ball_mask[:, None], 0)
+ 
+         ctx.mark_non_differentiable(idx)
+         ctx.mark_non_differentiable(empty_ball_mask)
+@@ -70,17 +96,18 @@ class GroupingOperation(Function):
+         assert idx.is_contiguous()
+         assert idx_batch_cnt.is_contiguous()
+ 
+-        assert features.shape[0] == features_batch_cnt.sum(), \
+-            'features: %s, features_batch_cnt: %s' % (str(features.shape), str(features_batch_cnt))
+-        assert idx.shape[0] == idx_batch_cnt.sum(), \
+-            'idx: %s, idx_batch_cnt: %s' % (str(idx.shape), str(idx_batch_cnt))
++        if _DEBUG_ASSERTS:
++            assert features.shape[0] == features_batch_cnt.sum(), \
++                'features: %s, features_batch_cnt: %s' % (str(features.shape), str(features_batch_cnt))
++            assert idx.shape[0] == idx_batch_cnt.sum(), \
++                'idx: %s, idx_batch_cnt: %s' % (str(idx.shape), str(idx_batch_cnt))
+ 
+         M, nsample = idx.size()
+         N, C = features.size()
+         B = idx_batch_cnt.shape[0]
+         output = torch.cuda.FloatTensor(M, C, nsample)
+ 
+-        pointnet2.group_points_wrapper(B, M, C, nsample, features, features_batch_cnt, idx, idx_batch_cnt, output)
++        _group_points_wrapper(B, M, C, nsample, features, features_batch_cnt, idx, idx_batch_cnt, output)
+ 
+         ctx.for_backwards = (B, N, idx, features_batch_cnt, idx_batch_cnt)
+         return output
+@@ -134,20 +161,21 @@ class QueryAndGroup(nn.Module):
+         Returns:
+             new_features: (M1 + M2, C, nsample) tensor
+         """
+-        assert xyz.shape[0] == xyz_batch_cnt.sum(), 'xyz: %s, xyz_batch_cnt: %s' % (str(xyz.shape), str(new_xyz_batch_cnt))
+-        assert new_xyz.shape[0] == new_xyz_batch_cnt.sum(), \
+-            'new_xyz: %s, new_xyz_batch_cnt: %s' % (str(new_xyz.shape), str(new_xyz_batch_cnt))
++        if _DEBUG_ASSERTS:
++            assert xyz.shape[0] == xyz_batch_cnt.sum(), 'xyz: %s, xyz_batch_cnt: %s' % (str(xyz.shape), str(new_xyz_batch_cnt))
++            assert new_xyz.shape[0] == new_xyz_batch_cnt.sum(), \
++                'new_xyz: %s, new_xyz_batch_cnt: %s' % (str(new_xyz.shape), str(new_xyz_batch_cnt))
+ 
+         # idx: (M1 + M2 ..., nsample), empty_ball_mask: (M1 + M2 ...)
+         idx, empty_ball_mask = ball_query(self.radius, self.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
+         grouped_xyz = grouping_operation(xyz, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, 3, nsample)
+         grouped_xyz -= new_xyz.unsqueeze(-1)
+ 
+-        grouped_xyz[empty_ball_mask] = 0
++        grouped_xyz.masked_fill_(empty_ball_mask[:, None, None], 0)
+ 
+         if features is not None:
+             grouped_features = grouping_operation(features, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, C, nsample)
+-            grouped_features[empty_ball_mask] = 0
++            grouped_features.masked_fill_(empty_ball_mask[:, None, None], 0)
+             if self.use_xyz:
+                 new_features = torch.cat([grouped_xyz, grouped_features], dim=1)  # (M1 + M2 ..., C + 3, nsample)
+             else:
+@@ -177,7 +205,7 @@ class FarthestPointSampling(Function):
+         output = torch.cuda.IntTensor(B, npoint)
+         temp = torch.cuda.FloatTensor(B, N).fill_(1e10)
+ 
+-        pointnet2.farthest_point_sampling_wrapper(B, N, npoint, xyz, temp, output)
++        _fps_wrapper(B, N, npoint, xyz, temp, output)
+         return output
+ 
+     @staticmethod
+diff --git a/pcdet/ops/pointnet2/pointnet2_stack/src/opt_ops_gpu.cu b/pcdet/ops/pointnet2/pointnet2_stack/src/opt_ops_gpu.cu
+new file mode 100644
+index 0000000..c1acedc
+--- /dev/null
++++ b/pcdet/ops/pointnet2/pointnet2_stack/src/opt_ops_gpu.cu
+@@ -0,0 +1,287 @@
++#include <torch/extension.h>
++#include <ATen/cuda/CUDAContext.h>
++#include <cooperative_groups.h>
++#include <cmath>
++namespace cg = cooperative_groups;
++
++__global__ void bq_kernel_a(int B, int M, float radius, int nsample,
++    const float *__restrict__ new_xyz, const int *__restrict__ new_xyz_batch_cnt,
++    const float *__restrict__ xyz, const int *__restrict__ xyz_batch_cnt, int *__restrict__ idx) {
++    int pt_idx = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
++    int lane = threadIdx.x & 31;
++    if (pt_idx >= M) return;
++
++    int bs_idx = 0, pt_cnt = new_xyz_batch_cnt[0];
++    for (int k = 1; k < B; k++) {
++        if (pt_idx < pt_cnt) break;
++        pt_cnt += new_xyz_batch_cnt[k];
++        bs_idx = k;
++    }
++    int xyz_batch_start_idx = 0;
++    for (int k = 0; k < bs_idx; k++) xyz_batch_start_idx += xyz_batch_cnt[k];
++
++    new_xyz += pt_idx * 3;
++    xyz += xyz_batch_start_idx * 3;
++    idx += pt_idx * nsample;
++
++    float radius2 = radius * radius;
++    float new_x = new_xyz[0];
++    float new_y = new_xyz[1];
++    float new_z = new_xyz[2];
++    int n = xyz_batch_cnt[bs_idx];
++
++    int cnt = 0;
++    for (int base = 0; base < n; base += 32) {
++        int k = base + lane;
++        bool hit = false;
++        if (k < n) {
++            float x = xyz[k * 3 + 0];
++            float y = xyz[k * 3 + 1];
++            float z = xyz[k * 3 + 2];
++            float d2 = (new_x - x) * (new_x - x) + (new_y - y) * (new_y - y) + (new_z - z) * (new_z - z);
++            hit = d2 < radius2;
++        }
++        unsigned mask = __ballot_sync(0xffffffffu, hit);
++        if (mask) {
++            if (cnt == 0) {
++                int first = base + __ffs(mask) - 1;
++                for (int l = lane; l < nsample; l += 32) idx[l] = first;
++                __syncwarp();
++            }
++            int rank = cnt + __popc(mask & ((1u << lane) - 1u));
++            if (hit && rank < nsample) idx[rank] = k;
++            cnt += __popc(mask);
++            if (cnt >= nsample) break;
++        }
++    }
++    if (cnt == 0 && lane == 0) idx[0] = -1;
++}
++
++void ball_query_wrapper(int B, int M, double radius, int nsample, at::Tensor new_xyz, at::Tensor new_xyz_batch_cnt,
++                        at::Tensor xyz, at::Tensor xyz_batch_cnt, at::Tensor idx) {
++    if (M <= 0) return;
++    const int threads = 256;
++    long long total = (long long)M * 32;
++    int blocks = (int)((total + threads - 1) / threads);
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++    bq_kernel_a<<<blocks, threads, 0, stream>>>(B, M, (float)radius, nsample,
++        new_xyz.data_ptr<float>(), new_xyz_batch_cnt.data_ptr<int>(),
++        xyz.data_ptr<float>(), xyz_batch_cnt.data_ptr<int>(), idx.data_ptr<int>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++struct Cand { float v; int k; };
++
++__device__ __forceinline__ bool better(float v, int k, float bv, int bk, int S) {
++    if (v != bv) return v > bv;
++    int r = k % S, br = bk % S;
++    if (r != br) return r < br;
++    return k < bk;
++}
++
++__global__ void fps_kernel_a(int n, int m, int chunk, int S,
++    const float *__restrict__ dataset, int *__restrict__ idxs,
++    float *__restrict__ g_v, int *__restrict__ g_k) {
++    cg::grid_group grid = cg::this_grid();
++    extern __shared__ float sh[];
++    float *sx = sh, *sy = sh + chunk, *sz = sh + 2 * chunk, *st = sh + 3 * chunk;
++    __shared__ float wv[32];
++    __shared__ int wk[32];
++    __shared__ int s_old;
++
++    const int G = gridDim.x;
++    const int start = blockIdx.x * chunk;
++    const int cnt = max(0, min(chunk, n - start));
++    for (int i = threadIdx.x; i < cnt; i += blockDim.x) {
++        sx[i] = dataset[(start + i) * 3 + 0];
++        sy[i] = dataset[(start + i) * 3 + 1];
++        sz[i] = dataset[(start + i) * 3 + 2];
++        st[i] = 1e10f;
++    }
++    if (blockIdx.x == 0 && threadIdx.x == 0) idxs[0] = 0;
++    int old = 0;
++    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
++    __syncthreads();
++
++    for (int j = 1; j < m; j++) {
++        float x1 = dataset[old * 3 + 0];
++        float y1 = dataset[old * 3 + 1];
++        float z1 = dataset[old * 3 + 2];
++        float best = -1.f; int besti = 0x7fffffff;
++        for (int i = threadIdx.x; i < cnt; i += blockDim.x) {
++            float x2 = sx[i], y2 = sy[i], z2 = sz[i];
++            float d = (x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1) + (z2 - z1) * (z2 - z1);
++            float d2 = min(d, st[i]);
++            st[i] = d2;
++            int k = start + i;
++            if (better(d2, k, best, besti, S)) { best = d2; besti = k; }
++        }
++        for (int off = 16; off > 0; off >>= 1) {
++            float ov = __shfl_down_sync(0xffffffffu, best, off);
++            int ok = __shfl_down_sync(0xffffffffu, besti, off);
++            if (better(ov, ok, best, besti, S)) { best = ov; besti = ok; }
++        }
++        if (lane == 0) { wv[wid] = best; wk[wid] = besti; }
++        __syncthreads();
++        if (wid == 0) {
++            best = lane < nw ? wv[lane] : -1.f;
++            besti = lane < nw ? wk[lane] : 0x7fffffff;
++            for (int off = 16; off > 0; off >>= 1) {
++                float ov = __shfl_down_sync(0xffffffffu, best, off);
++                int ok = __shfl_down_sync(0xffffffffu, besti, off);
++                if (better(ov, ok, best, besti, S)) { best = ov; besti = ok; }
++            }
++            if (lane == 0) {
++                g_v[(j & 1) * G + blockIdx.x] = best;
++                g_k[(j & 1) * G + blockIdx.x] = besti;
++            }
++        }
++        grid.sync();
++        if (wid == 0) {
++            best = -1.f; besti = 0x7fffffff;
++            for (int g = lane; g < G; g += 32) {
++                float ov = g_v[(j & 1) * G + g];
++                int ok = g_k[(j & 1) * G + g];
++                if (better(ov, ok, best, besti, S)) { best = ov; besti = ok; }
++            }
++            for (int off = 16; off > 0; off >>= 1) {
++                float ov = __shfl_down_sync(0xffffffffu, best, off);
++                int ok = __shfl_down_sync(0xffffffffu, besti, off);
++                if (better(ov, ok, best, besti, S)) { best = ov; besti = ok; }
++            }
++            if (lane == 0) s_old = besti;
++        }
++        __syncthreads();
++        old = s_old;
++        if (blockIdx.x == 0 && threadIdx.x == 0) idxs[j] = old;
++
++    }
++}
++
++static int opt_n_threads(int work_size) {
++    const int pow_2 = std::log(static_cast<double>(work_size)) / std::log(2.0);
++    return std::max(std::min(1 << pow_2, 1024), 1);
++}
++
++void farthest_point_sampling_wrapper(int b, int n, int m, at::Tensor points, at::Tensor temp, at::Tensor idx) {
++    if (m <= 0) return;
++    int dev; cudaGetDevice(&dev);
++    int sms; cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
++    int maxsh = 0; cudaDeviceGetAttribute(&maxsh, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
++    int G = sms;
++    const int threads = 256;
++    size_t budget = (size_t)maxsh - 1024;
++    int chunk = (n + G - 1) / G;
++    if ((size_t)chunk * 4 * sizeof(float) > budget) {
++        chunk = (int)(budget / (4 * sizeof(float)));
++        G = (n + chunk - 1) / chunk;
++    }
++    size_t shmem = (size_t)chunk * 4 * sizeof(float);
++    cudaFuncSetAttribute(fps_kernel_a, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)budget);
++    int maxb = 0;
++    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxb, fps_kernel_a, threads, shmem);
++    TORCH_CHECK((long long)maxb * sms >= G, "fps: launch configuration does not fit");
++    const int S = opt_n_threads(n);
++    auto scratch_v = torch::empty({2 * G}, points.options());
++    auto scratch_k = torch::empty({2 * G}, idx.options());
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++    for (int bi = 0; bi < b; bi++) {
++        const float *ds = points.data_ptr<float>() + (size_t)bi * n * 3;
++        int *out = idx.data_ptr<int>() + (size_t)bi * m;
++        float *gv = scratch_v.data_ptr<float>();
++        int *gk = scratch_k.data_ptr<int>();
++        void *args[] = {(void *)&n, (void *)&m, (void *)&chunk, (void *)&S, (void *)&ds, (void *)&out,
++                        (void *)&gv, (void *)&gk};
++        C10_CUDA_CHECK(cudaLaunchCooperativeKernel((void *)fps_kernel_a, dim3(G), dim3(threads), args, shmem, stream));
++    }
++}
++
++__global__ void group_points_kernel_stack_s(int B, int M, int C, int nsample,
++    const float *features, const int *features_batch_cnt, const int *idx, const int *idx_batch_cnt, float *out) {
++    int index = blockIdx.x * blockDim.x + threadIdx.x;
++    int sample_idx = index % nsample;
++    int C_idx = (index / nsample) % C;
++    int pt_idx = (index / nsample / C);
++    if (pt_idx >= M || C_idx >= C || sample_idx >= nsample) return;
++    int bs_idx = 0, pt_cnt = idx_batch_cnt[0];
++    for (int k = 1; k < B; k++) {
++        if (pt_idx < pt_cnt) break;
++        pt_cnt += idx_batch_cnt[k];
++        bs_idx = k;
++    }
++    int features_batch_start_idx = 0;
++    for (int k = 0; k < bs_idx; k++) features_batch_start_idx += features_batch_cnt[k];
++    features += features_batch_start_idx * C;
++    idx += pt_idx * nsample + sample_idx;
++    int in_idx = idx[0] * C + C_idx;
++    int out_idx = pt_idx * C * nsample + C_idx * nsample + sample_idx;
++    out[out_idx] = features[in_idx];
++}
++
++void group_points_wrapper(int B, int M, int C, int nsample, at::Tensor features, at::Tensor features_batch_cnt,
++                          at::Tensor idx, at::Tensor idx_batch_cnt, at::Tensor out) {
++    long long total = (long long)M * C * nsample;
++    if (total <= 0) return;
++    const int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++    group_points_kernel_stack_s<<<blocks, threads, 0, stream>>>(B, M, C, nsample, features.data_ptr<float>(),
++        features_batch_cnt.data_ptr<int>(), idx.data_ptr<int>(), idx_batch_cnt.data_ptr<int>(), out.data_ptr<float>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++__global__ void group_kernel_b(int B, int M, int C, int nsample,
++    const float *__restrict__ xyz, const float *__restrict__ features, const int *__restrict__ xyz_batch_cnt,
++    const float *__restrict__ new_xyz, const int *__restrict__ idx, const int *__restrict__ idx_batch_cnt,
++    const bool *__restrict__ empty, float *__restrict__ out) {
++    const int C3 = C + 3;
++    long long index = (long long)blockIdx.x * blockDim.x + threadIdx.x;
++    long long total = (long long)C3 * M * nsample;
++    if (index >= total) return;
++    int s = index % nsample;
++    int m = (index / nsample) % M;
++    int c = index / ((long long)nsample * M);
++    int bs_idx = 0, pt_cnt = idx_batch_cnt[0];
++    for (int k = 1; k < B; k++) {
++        if (m < pt_cnt) break;
++        pt_cnt += idx_batch_cnt[k];
++        bs_idx = k;
++    }
++    int start = 0;
++    for (int k = 0; k < bs_idx; k++) start += xyz_batch_cnt[k];
++    float v;
++    if (empty[m]) {
++        v = 0.f;
++    } else {
++        int j = start + idx[m * nsample + s];
++        if (c < 3) {
++            float g = xyz[j * 3 + c];
++            g -= new_xyz[m * 3 + c];
++            v = g;
++        } else {
++            v = features[(long long)j * C + (c - 3)];
++        }
++    }
++    out[index] = v;
++}
++
++void fused_group_wrapper(int B, int M, int C, int nsample, at::Tensor xyz, at::Tensor features, at::Tensor xyz_batch_cnt,
++                         at::Tensor new_xyz, at::Tensor idx, at::Tensor idx_batch_cnt, at::Tensor empty, at::Tensor out) {
++    long long total = (long long)(C + 3) * M * nsample;
++    if (total <= 0) return;
++    const int threads = 256;
++    int blocks = (int)((total + threads - 1) / threads);
++    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++    group_kernel_b<<<blocks, threads, 0, stream>>>(B, M, C, nsample, xyz.data_ptr<float>(),
++        C > 0 ? features.data_ptr<float>() : xyz.data_ptr<float>(), xyz_batch_cnt.data_ptr<int>(),
++        new_xyz.data_ptr<float>(), idx.data_ptr<int>(), idx_batch_cnt.data_ptr<int>(), empty.data_ptr<bool>(),
++        out.data_ptr<float>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
++    m.def("ball_query_wrapper", &ball_query_wrapper, "ball query");
++    m.def("farthest_point_sampling_wrapper", &farthest_point_sampling_wrapper, "farthest point sampling");
++    m.def("group_points_wrapper", &group_points_wrapper, "grouping");
++    m.def("fused_group_wrapper", &fused_group_wrapper, "QueryAndGroup");
++}
+diff --git a/setup.py b/setup.py
+index f5a31d9..ba5f7e2 100644
+--- a/setup.py
++++ b/setup.py
+@@ -101,6 +101,11 @@ if __name__ == '__main__':
+                     'src/vector_pool_gpu.cu'
+                 ],
+             ),
++            make_cuda_ext(
++                name='pointnet2_stack_fast_cuda',
++                module='pcdet.ops.pointnet2.pointnet2_stack',
++                sources=['src/opt_ops_gpu.cu'],
++            ),
+             make_cuda_ext(
+                 name='pointnet2_batch_cuda',
+                 module='pcdet.ops.pointnet2.pointnet2_batch',

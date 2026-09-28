@@ -1,8 +1,34 @@
+import os
+
 import torch
 import torch.nn as nn
 from torch.autograd import Function, Variable
 
 from . import pointnet2_stack_cuda as pointnet2
+
+
+def _load_fast_ops():
+    if os.environ.get('PCDET_OPT_3', '1') == '0':
+        return None
+    try:
+        from . import pointnet2_stack_fast_cuda
+        return pointnet2_stack_fast_cuda
+    except ImportError:
+        pass
+    try:
+        from torch.utils.cpp_extension import load
+        return load(name='pointnet2_stack_fast_cuda', extra_cuda_cflags=['-O3'], verbose=False,
+                    sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), 'src', 'opt_ops_gpu.cu')])
+    except Exception as e:
+        print('pointnet2_stack: optimized ops unavailable (%s), using the stock path' % e)
+        return None
+
+
+_fast = _load_fast_ops()
+_DEBUG_ASSERTS = os.environ.get('PCDET_DEBUG_ASSERTS', '0') == '1'
+_ball_query_wrapper = _fast.ball_query_wrapper if _fast is not None else pointnet2.ball_query_wrapper
+_group_points_wrapper = _fast.group_points_wrapper if _fast is not None else pointnet2.group_points_wrapper
+_fps_wrapper = _fast.farthest_point_sampling_wrapper if _fast is not None else pointnet2.farthest_point_sampling_wrapper
 
 
 class BallQuery(Function):
@@ -32,9 +58,9 @@ class BallQuery(Function):
         M = new_xyz.shape[0]
         idx = torch.cuda.IntTensor(M, nsample).zero_()
 
-        pointnet2.ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
+        _ball_query_wrapper(B, M, radius, nsample, new_xyz, new_xyz_batch_cnt, xyz, xyz_batch_cnt, idx)
         empty_ball_mask = (idx[:, 0] == -1)
-        idx[empty_ball_mask] = 0
+        idx.masked_fill_(empty_ball_mask[:, None], 0)
 
         ctx.mark_non_differentiable(idx)
         ctx.mark_non_differentiable(empty_ball_mask)
@@ -70,17 +96,18 @@ class GroupingOperation(Function):
         assert idx.is_contiguous()
         assert idx_batch_cnt.is_contiguous()
 
-        assert features.shape[0] == features_batch_cnt.sum(), \
-            'features: %s, features_batch_cnt: %s' % (str(features.shape), str(features_batch_cnt))
-        assert idx.shape[0] == idx_batch_cnt.sum(), \
-            'idx: %s, idx_batch_cnt: %s' % (str(idx.shape), str(idx_batch_cnt))
+        if _DEBUG_ASSERTS:
+            assert features.shape[0] == features_batch_cnt.sum(), \
+                'features: %s, features_batch_cnt: %s' % (str(features.shape), str(features_batch_cnt))
+            assert idx.shape[0] == idx_batch_cnt.sum(), \
+                'idx: %s, idx_batch_cnt: %s' % (str(idx.shape), str(idx_batch_cnt))
 
         M, nsample = idx.size()
         N, C = features.size()
         B = idx_batch_cnt.shape[0]
         output = torch.cuda.FloatTensor(M, C, nsample)
 
-        pointnet2.group_points_wrapper(B, M, C, nsample, features, features_batch_cnt, idx, idx_batch_cnt, output)
+        _group_points_wrapper(B, M, C, nsample, features, features_batch_cnt, idx, idx_batch_cnt, output)
 
         ctx.for_backwards = (B, N, idx, features_batch_cnt, idx_batch_cnt)
         return output
@@ -134,20 +161,21 @@ class QueryAndGroup(nn.Module):
         Returns:
             new_features: (M1 + M2, C, nsample) tensor
         """
-        assert xyz.shape[0] == xyz_batch_cnt.sum(), 'xyz: %s, xyz_batch_cnt: %s' % (str(xyz.shape), str(new_xyz_batch_cnt))
-        assert new_xyz.shape[0] == new_xyz_batch_cnt.sum(), \
-            'new_xyz: %s, new_xyz_batch_cnt: %s' % (str(new_xyz.shape), str(new_xyz_batch_cnt))
+        if _DEBUG_ASSERTS:
+            assert xyz.shape[0] == xyz_batch_cnt.sum(), 'xyz: %s, xyz_batch_cnt: %s' % (str(xyz.shape), str(new_xyz_batch_cnt))
+            assert new_xyz.shape[0] == new_xyz_batch_cnt.sum(), \
+                'new_xyz: %s, new_xyz_batch_cnt: %s' % (str(new_xyz.shape), str(new_xyz_batch_cnt))
 
         # idx: (M1 + M2 ..., nsample), empty_ball_mask: (M1 + M2 ...)
         idx, empty_ball_mask = ball_query(self.radius, self.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
         grouped_xyz = grouping_operation(xyz, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, 3, nsample)
         grouped_xyz -= new_xyz.unsqueeze(-1)
 
-        grouped_xyz[empty_ball_mask] = 0
+        grouped_xyz.masked_fill_(empty_ball_mask[:, None, None], 0)
 
         if features is not None:
             grouped_features = grouping_operation(features, xyz_batch_cnt, idx, new_xyz_batch_cnt)  # (M1 + M2, C, nsample)
-            grouped_features[empty_ball_mask] = 0
+            grouped_features.masked_fill_(empty_ball_mask[:, None, None], 0)
             if self.use_xyz:
                 new_features = torch.cat([grouped_xyz, grouped_features], dim=1)  # (M1 + M2 ..., C + 3, nsample)
             else:
@@ -177,7 +205,7 @@ class FarthestPointSampling(Function):
         output = torch.cuda.IntTensor(B, npoint)
         temp = torch.cuda.FloatTensor(B, N).fill_(1e10)
 
-        pointnet2.farthest_point_sampling_wrapper(B, N, npoint, xyz, temp, output)
+        _fps_wrapper(B, N, npoint, xyz, temp, output)
         return output
 
     @staticmethod

@@ -1,6 +1,10 @@
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
+
+_OPT_8 = os.environ.get('PCDET_OPT_2', '1') != '0'
 
 
 class BaseBEVBackbone(nn.Module):
@@ -86,28 +90,31 @@ class BaseBEVBackbone(nn.Module):
         Returns:
         """
         spatial_features = data_dict['spatial_features']
-        ups = []
-        ret_dict = {}
-        x = spatial_features
-        for i in range(len(self.blocks)):
-            x = self.blocks[i](x)
+        opt_9 = _OPT_8 and not self.training and spatial_features.is_cuda
+        with torch.autocast('cuda', dtype=torch.float16, enabled=opt_9):
+            ups = []
+            ret_dict = {}
+            x = spatial_features
+            for i in range(len(self.blocks)):
+                x = self.blocks[i](x)
 
-            stride = int(spatial_features.shape[2] / x.shape[2])
-            ret_dict['spatial_features_%dx' % stride] = x
-            if len(self.deblocks) > 0:
-                ups.append(self.deblocks[i](x))
-            else:
-                ups.append(x)
+                stride = int(spatial_features.shape[2] / x.shape[2])
+                ret_dict['spatial_features_%dx' % stride] = x
+                if len(self.deblocks) > 0:
+                    ups.append(self.deblocks[i](x))
+                else:
+                    ups.append(x)
 
-        if len(ups) > 1:
-            x = torch.cat(ups, dim=1)
-        elif len(ups) == 1:
-            x = ups[0]
+            if len(ups) > 1:
+                x = torch.cat(ups, dim=1)
+            elif len(ups) == 1:
+                x = ups[0]
 
-        if len(self.deblocks) > len(self.blocks):
-            x = self.deblocks[-1](x)
+            if len(self.deblocks) > len(self.blocks):
+                x = self.deblocks[-1](x)
 
-        data_dict['spatial_features_2d'] = x
+
+        data_dict['spatial_features_2d'] = x.float()
 
         return data_dict
 

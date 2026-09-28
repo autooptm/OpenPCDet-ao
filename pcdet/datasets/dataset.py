@@ -1,3 +1,4 @@
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -176,6 +177,11 @@ class DatasetTemplate(torch_data.Dataset):
                 voxel_num_points: optional (num_voxels)
                 ...
         """
+        if not self.training and set(data_dict) <= {'points', 'frame_id'}:
+            plan = self._opt_4()
+            if plan:
+                return self._opt_5(data_dict, plan)
+
         if self.training:
             assert 'gt_boxes' in data_dict, 'gt_boxes should be provided for training'
             gt_boxes_mask = np.array([n in self.class_names for n in data_dict['gt_names']], dtype=np.bool_)
@@ -217,8 +223,87 @@ class DatasetTemplate(torch_data.Dataset):
 
         return data_dict
 
+    def _opt_4(self):
+        plan = getattr(self, '_opt_7', None)
+        if plan is not None:
+            return plan
+        plan = False
+        enc = self.point_feature_encoder.point_encoding_config
+        queue = self.data_processor.data_processor_queue
+        names = [getattr(f, 'func', f).__name__ for f in queue]
+        if (os.environ.get('PCDET_OPT_1', '1') != '0' and torch.cuda.is_available()
+                and torch_data.get_worker_info() is None
+                and enc.encoding_type == 'absolute_coordinates_encoding'
+                and list(enc.used_feature_list) == list(enc.src_feature_list)
+                and names == ['mask_points_and_boxes_outside_range', 'shuffle_points', 'transform_points_to_voxels']):
+            vox_cfg = queue[2].keywords['config']
+            if not vox_cfg.get('DOUBLE_FLIP', False) and not queue[1].keywords['config'].SHUFFLE_ENABLED[self.mode]:
+                dev = torch.device('cuda', torch.cuda.current_device())
+                grid = [int(g) for g in self.data_processor.grid_size]
+                plan = {
+                    'range': torch.tensor(self.point_cloud_range, dtype=torch.float32, device=dev),
+                    'voxel_size': torch.tensor(vox_cfg.VOXEL_SIZE, dtype=torch.float32, device=dev),
+                    'grid': grid, 'grid_t': torch.tensor(grid, dtype=torch.float32, device=dev),
+                    'max_points': int(vox_cfg.MAX_POINTS_PER_VOXEL),
+                    'max_voxels': int(vox_cfg.MAX_NUMBER_OF_VOXELS[self.mode]),
+                }
+        self._opt_7 = plan
+        return plan
+
+    def _opt_5(self, data_dict, plan):
+        """Same outputs as the CPU path (mask_points_by_range + spconv Point2VoxelCPU3d): voxels are
+        numbered in order of first point arrival, filled in point order up to max_points, capped at
+        max_voxels (later new voxels dropped), zero padded; coords (z, y, x)."""
+        rng = plan['range']
+        pts = torch.from_numpy(data_dict['points']).to(rng.device)
+        mask = (pts[:, 0] >= rng[0]) & (pts[:, 0] <= rng[3]) & (pts[:, 1] >= rng[1]) & (pts[:, 1] <= rng[4])
+        pts = pts[mask]
+        coor = torch.floor((pts[:, :3] - rng[:3]) / plan['voxel_size'])
+        valid_idx = ((coor >= 0) & (coor < plan['grid_t'])).all(dim=1).nonzero().squeeze(1)
+        coor = coor[valid_idx].long()
+        gx, gy, _ = plan['grid']
+        key = (coor[:, 2] * gy + coor[:, 1]) * gx + coor[:, 0]
+        uniq, inv = torch.unique(key, sorted=True, return_inverse=True)
+        num_uniq = uniq.numel()
+        first = torch.full((num_uniq,), torch.iinfo(torch.int64).max, dtype=torch.int64, device=pts.device)
+        first.scatter_reduce_(0, inv, valid_idx, reduce='amin', include_self=True)
+        order = torch.argsort(first)
+        rank = torch.empty_like(order)
+        rank[order] = torch.arange(num_uniq, device=pts.device)
+        num_voxels = min(num_uniq, plan['max_voxels'])
+        point_rank = rank[inv]
+        counts = torch.bincount(point_rank, minlength=num_uniq)
+        sorted_rank, perm = torch.sort(point_rank, stable=True)
+        slot = torch.empty_like(point_rank)
+        slot[perm] = torch.arange(point_rank.numel(), device=pts.device) - (torch.cumsum(counts, 0) - counts)[sorted_rank]
+        keep = (point_rank < num_voxels) & (slot < plan['max_points'])
+        voxels = pts.new_zeros((num_voxels, plan['max_points'], pts.shape[1]))
+        voxels[point_rank[keep], slot[keep]] = pts[valid_idx[keep]]
+        k = uniq[order[:num_voxels]]
+        coords = torch.stack([k // (gx * gy), (k // gx) % gy, k % gx], dim=1).int()
+        return {'points': pts, 'frame_id': data_dict.get('frame_id'), 'lidar_aug_matrix': np.eye(4),
+                'use_lead_xyz': True, 'voxels': voxels, 'voxel_coords': coords,
+                'voxel_num_points': counts[:num_voxels].clamp(max=plan['max_points']).int()}
+
+    @staticmethod
+    def _opt_6(sample):
+        pts, coords = sample['points'], sample['voxel_coords']
+        dev = pts.device
+        return {
+            'points': torch.cat([pts.new_zeros((pts.shape[0], 1)), pts], dim=1),
+            'frame_id': np.stack([sample['frame_id']], axis=0),
+            'lidar_aug_matrix': torch.from_numpy(np.stack([sample['lidar_aug_matrix']], axis=0)).float().to(dev),
+            'use_lead_xyz': torch.ones(1, dtype=torch.float32, device=dev),
+            'voxels': sample['voxels'],
+            'voxel_coords': torch.cat([coords.new_zeros((coords.shape[0], 1)), coords], dim=1).float(),
+            'voxel_num_points': sample['voxel_num_points'].float(),
+            'batch_size': 1,
+        }
+
     @staticmethod
     def collate_batch(batch_list, _unused=False):
+        if len(batch_list) == 1 and torch.is_tensor(batch_list[0].get('voxels')):
+            return DatasetTemplate._opt_6(batch_list[0])
         data_dict = defaultdict(list)
         for cur_sample in batch_list:
             for key, val in cur_sample.items():

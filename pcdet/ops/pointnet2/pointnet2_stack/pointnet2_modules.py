@@ -87,11 +87,22 @@ class StackSAModuleMSG(nn.Module):
             new_features: (M1 + M2 ..., \sum_k(mlps[k][-1])) tensor of the new_features descriptors
         """
         new_features_list = []
+        fused = pointnet2_utils._fast is not None and features is not None and xyz.is_cuda \
+            and all(g.use_xyz for g in self.groupers)
         for k in range(len(self.groupers)):
-            new_features, ball_idxs = self.groupers[k](
-                xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features
-            )  # (M1 + M2, C, nsample)
-            new_features = new_features.permute(1, 0, 2).unsqueeze(dim=0)  # (1, C, M1 + M2 ..., nsample)
+            if fused:
+                grouper = self.groupers[k]
+                ball_idxs, empty_ball_mask = pointnet2_utils.ball_query(
+                    grouper.radius, grouper.nsample, xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt)
+                new_features = xyz.new_empty((1, features.shape[1] + 3, new_xyz.shape[0], grouper.nsample))
+                pointnet2_utils._fast.fused_group_wrapper(
+                    xyz_batch_cnt.shape[0], new_xyz.shape[0], features.shape[1], grouper.nsample, xyz, features,
+                    xyz_batch_cnt, new_xyz, ball_idxs, new_xyz_batch_cnt, empty_ball_mask, new_features)
+            else:
+                new_features, ball_idxs = self.groupers[k](
+                    xyz, xyz_batch_cnt, new_xyz, new_xyz_batch_cnt, features
+                )  # (M1 + M2, C, nsample)
+                new_features = new_features.permute(1, 0, 2).unsqueeze(dim=0)  # (1, C, M1 + M2 ..., nsample)
             new_features = self.mlps[k](new_features)  # (1, C, M1 + M2 ..., nsample)
 
             if self.pool_method == 'max_pool':
